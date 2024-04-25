@@ -1,0 +1,320 @@
+import torch.optim.lr_scheduler as lr_scheduler
+import os
+import torch
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from PIL import Image
+import torchvision
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+import torch.optim as optim
+import torch.nn as nn
+from torchvision.ops import nms
+
+def set_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    else:
+        return torch.device("cpu")
+
+class CustomDataset(Dataset):
+    def __init__(self, image_dir, label_dir, transform=None):
+        self.image_dir = image_dir
+        self.label_dir = label_dir
+        self.transform = transform
+        self.image_names = os.listdir(image_dir)
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.image_dir, self.image_names[idx])
+        image = Image.open(img_name).convert("RGB")
+        
+        label_name = os.path.join(self.label_dir, os.path.splitext(self.image_names[idx])[0] + '.txt')
+        with open(label_name, 'r') as file:
+            labels = file.readlines()
+        
+        # Parsing labels
+        boxes = []
+        class_labels = []
+        for label in labels:
+            class_id, center_x, center_y, width, height = map(float, label.strip().split())
+            x_min = center_x - width / 2
+            y_min = center_y - height / 2
+            x_max = x_min + width
+            y_max = y_min + height
+            boxes.append([x_min, y_min, x_max, y_max])
+            class_labels.append(int(class_id) + 1)
+
+        boxes = torch.tensor(boxes, dtype=torch.float32)
+        labels = class_labels
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return {
+            'image': image,
+            'target': {
+                'boxes': boxes,
+                'labels': labels
+            }
+        }
+    
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+valid_and_test_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+
+
+import os
+import shutil
+source_dirs = [
+    "/kaggle/input/newest-data/train/images",
+    "/kaggle/input/newest-data-adding/train/images",
+    "/kaggle/input/newest-data-addition-2/train/images"
+]
+
+destination_dir = "/kaggle/working/consolidated_images"
+if not os.path.exists(destination_dir):
+    os.makedirs(destination_dir)
+for source_dir in source_dirs:
+    # Iterate over each file in the source directory
+    for filename in os.listdir(source_dir):
+        # Get the full path of the source file
+        source_file = os.path.join(source_dir, filename)
+        # Get the full path of the destination file
+        destination_file = os.path.join(destination_dir, filename)
+        # Copy the file from the source directory to the destination directory
+        shutil.copyfile(source_file, destination_file)
+
+import os
+import shutil
+
+# Define the source label directories
+source_label_dirs = [
+    "/kaggle/input/newest-data/train/labels",
+    "/kaggle/input/newest-data-adding/train/labels",
+    "/kaggle/input/newest-data-addition-2/train/labels"
+]
+
+# Define the destination directory for labels
+destination_label_dir = "/kaggle/working/consolidated_labels"
+
+# Create the destination directory for labels if it doesn't exist
+if not os.path.exists(destination_label_dir):
+    os.makedirs(destination_label_dir)
+
+# Iterate over each source label directory
+for source_dir in source_label_dirs:
+    # Iterate over each label file in the source directory
+    for filename in os.listdir(source_dir):
+        # Get the full path of the source label file
+        source_file = os.path.join(source_dir, filename)
+        # Get the full path of the destination label file
+        destination_file = os.path.join(destination_label_dir, filename)
+        # Copy the label file from the source directory to the destination directory
+        shutil.copyfile(source_file, destination_file)
+
+
+train_dataset = CustomDataset(image_dir="/kaggle/working/consolidated_images", label_dir="/kaggle/working/consolidated_labels", transform=train_transform)
+print(len(train_dataset))
+valid_dataset = CustomDataset(image_dir="/kaggle/input/newest-data/valid/images", label_dir="/kaggle/input/newest-data/valid/labels", transform=valid_and_test_transform)
+test_dataset = CustomDataset(image_dir="/kaggle/input/newest-data/test/images", label_dir="/kaggle/input/newest-data/test/labels", transform=valid_and_test_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes=3)
+
+"""
+def freeze_model(model):
+    for param in model.parameters():
+        param.requires_grad = False
+
+freeze_model(model)
+
+for param in model.roi_heads.box_predictor.parameters():
+    param.requires_grad = True
+
+for param in model.roi_heads.box_head.parameters():
+    param.requires_grad = True
+
+layers_to_unfreeze = 20
+for layer in list(model.backbone.parameters())[-layers_to_unfreeze:]:
+    layer.requires_grad = True
+"""
+
+optimizer = optim.SGD(model.parameters(), lr=0.009, momentum=0.9)
+loss_function = nn.SmoothL1Loss()
+num_epochs = 55
+device = set_device()
+
+
+def train(model, optimizer, clr, train_data_loader, valid_data_loader, num_epochs, save_path):
+    best_val_loss = float('inf')
+    for epoch in range(num_epochs):
+        model.train()  # Set the model to training mode
+        total_train_loss = 0.0
+        for batch in train_data_loader:
+            images = batch["image"]
+            targets = batch["target"]
+            optimizer.zero_grad()
+            
+            targets_list = []
+            for i in range(len(images)):
+                target_dict = {}
+                for k, v in targets.items():
+                    target_dict[k] = v[i]
+                targets_list.append(target_dict)
+                
+            images = [image.to(device) for image in images]
+            targets_list = [{k: v.to(device) for k, v in target.items()} for target in targets_list]
+
+            model.to(device)
+            loss_dict = model(images, targets_list)
+            losses = sum(loss for loss in loss_dict.values())
+
+            losses.backward()
+            optimizer.step()
+
+            total_train_loss += losses.item()
+            
+        avg_train_loss = total_train_loss / len(train_data_loader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Avg Loss: {avg_train_loss:.4f}")
+        
+        model.eval()
+        total_val_loss = 0.0
+
+        with torch.no_grad():
+            for batch in valid_data_loader:
+                images = batch["image"]
+                targets = batch["target"]
+                targets_list = []
+                for i in range(len(images)):
+                    target_dict = {}
+                    for k, v in targets.items():
+                        target_dict[k] = v[i]
+                targets_list.append(target_dict)
+                images = [image.to(device) for image in images]
+                targets_list = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in target.items()} for target in targets_list]
+                loss_dict = model(images, targets_list)
+                total_val_loss += losses.item()
+                
+                for i in range(len(images)):
+                    boxes = loss_dict[i]['boxes']
+                    labels = loss_dict[i]['labels']
+                    scores = loss_dict[i]['scores']
+                    keep = nms(boxes, scores, iou_threshold=0.5)
+                    loss_dict[i]['boxes'] = boxes[keep]
+                    loss_dict[i]['labels'] = labels[keep]
+                    loss_dict[i]['scores'] = scores[keep]
+
+            avg_val_loss = total_val_loss / len(valid_data_loader)
+            print(f"Epoch [{epoch+1}/{num_epochs}], Validation Avg Loss: {avg_val_loss:.4f}")
+            
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), save_path)
+                print(f"Saved new best model with avg_val_loss: {avg_val_loss:.4f}")
+            
+clr = lr_scheduler.CyclicLR(optimizer, base_lr=0.001, max_lr=0.1, step_size_up=2000)
+
+save_path = 'best_model.pth'
+train(model, optimizer, clr, train_loader, valid_loader, num_epochs, save_path)
+model.load_state_dict(torch.load('best_model.pth'))
+
+from torchvision.ops import nms
+import torch
+import torchvision
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+# Set device
+device = set_device()
+
+# Define and load the model
+model = fasterrcnn_resnet50_fpn(pretrained=False)
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes=3)
+model.load_state_dict(torch.load('best_model.pth'))
+model.to(device)
+model.eval()
+
+
+# Function to visualize image with predicted bounding boxes and labels
+def visualize_prediction(image, prediction):
+    # Create figure and axis
+    fig, ax = plt.subplots(1)
+    ax.imshow(image.permute(1, 2, 0).cpu().numpy())  # Convert from tensor to numpy array and rearrange dimensions
+
+    # Get image dimensions
+    _, width, height = image.shape
+    
+    # Plot each predicted bounding box
+    for box, label, score in zip(prediction['boxes'], prediction['labels'], prediction['scores']):
+        # Scale the coordinates to the image dimensions
+        xmin, ymin, xmax, ymax = box.tolist()
+        xmin *= 224
+        xmax *= 224
+        ymin *= 224
+        ymax *= 224
+
+        # Calculate width and height of the rectangle
+        rect_width = xmax - xmin
+        rect_height = ymax - ymin
+
+        # Create a rectangle patch
+        rect = patches.Rectangle((xmin, ymin), rect_width, rect_height, linewidth=1, edgecolor='r', facecolor='none')
+
+        # Add the rectangle to the plot
+        ax.add_patch(rect)
+
+        # Add label text and confidence score
+        ax.text(xmin, ymin, f'Label: {int(label)} Score: {score:.2f}', color='r', fontsize=8)
+
+    # Show the plot
+    plt.show()
+
+
+
+# Set the model to evaluation mode
+model.eval()
+
+# Iterate through all images in the test dataset
+# 
+for sample_index in range(len(test_dataset)):
+    sample = test_dataset[sample_index]
+    sample_image = sample['image']
+    sample_target = sample['target']
+
+    # Make predictions on the sample image using your trained model
+    with torch.no_grad():
+        sample_image = sample_image.unsqueeze(0).to(device)  # Add batch dimension and move to device
+        predictions = model(sample_image)
+        boxes = predictions[0]['boxes']
+        labels = predictions[0]['labels']
+        scores = predictions[0]['scores']
+        
+        keep = nms(boxes, scores, iou_threshold=0.5)  # You can adjust the IoU threshold as needed
+        boxes = boxes[keep]
+        labels = labels[keep]
+        scores = scores[keep]
+        
+        predictions[0]['boxes'] = boxes
+        predictions[0]['labels'] = labels
+        predictions[0]['scores'] = scores
+
+    # Visualize the sample image with predicted bounding boxes and labels
+    visualize_prediction(sample_image[0], predictions[0])
